@@ -1,0 +1,3 @@
+Nar-Group: org.apache.nifi
+Nar-Id: list-swift
+Nar-Version: 1.0.0
