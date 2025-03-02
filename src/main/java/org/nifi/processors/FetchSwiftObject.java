@@ -9,6 +9,7 @@ import org.apache.nifi.components.AllowableValue;
 import org.apache.nifi.components.PropertyDescriptor;
 import org.apache.nifi.components.ValidationContext;
 import org.apache.nifi.components.ValidationResult;
+import org.apache.nifi.expression.ExpressionLanguageScope;
 import org.apache.nifi.flowfile.FlowFile;
 import org.apache.nifi.flowfile.attributes.CoreAttributes;
 import org.apache.nifi.logging.ComponentLog;
@@ -20,9 +21,7 @@ import org.apache.nifi.scheduling.SchedulingStrategy;
 import org.javaswift.joss.client.factory.AccountFactory;
 import org.javaswift.joss.client.factory.AuthenticationMethod;
 import org.javaswift.joss.instructions.DownloadInstructions;
-import org.javaswift.joss.model.Account;
-import org.javaswift.joss.model.Container;
-import org.javaswift.joss.model.StoredObject;
+import org.javaswift.joss.model.*;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -51,7 +50,6 @@ import java.util.concurrent.TimeUnit;
 )
 public class FetchSwiftObject extends AbstractProcessor {
 
-    // Relationships
     public static final Relationship REL_SUCCESS = new Relationship.Builder()
             .name("success")
             .description("FlowFiles successfully fetched from Swift")
@@ -62,11 +60,9 @@ public class FetchSwiftObject extends AbstractProcessor {
             .description("FlowFiles that failed to be fetched from Swift")
             .build();
 
-    // Auth method
     public static final AllowableValue TEMPAUTH = new AllowableValue("TEMPAUTH", "TempAuth", "v1 style auth");
     public static final AllowableValue KEYSTONE = new AllowableValue("KEYSTONE", "Keystone", "Keystone style auth");
 
-    // Properties
     public static final PropertyDescriptor SWIFT_AUTH_METHOD = new PropertyDescriptor.Builder()
             .name("swift-auth-method")
             .displayName("Swift Auth Method")
@@ -114,7 +110,7 @@ public class FetchSwiftObject extends AbstractProcessor {
             .displayName("Container")
             .description("Name of the container in Swift")
             .required(true)
-            .expressionLanguageSupported(org.apache.nifi.expression.ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
+            .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
             .build();
 
@@ -123,7 +119,7 @@ public class FetchSwiftObject extends AbstractProcessor {
             .displayName("Object Name")
             .description("Name/key of the object in Swift to fetch")
             .required(true)
-            .expressionLanguageSupported(org.apache.nifi.expression.ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
+            .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
             .build();
 
@@ -134,7 +130,7 @@ public class FetchSwiftObject extends AbstractProcessor {
             .required(false)
             .defaultValue("0 B")
             .addValidator(StandardValidators.DATA_SIZE_VALIDATOR)
-            .expressionLanguageSupported(org.apache.nifi.expression.ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
+            .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
             .build();
 
     public static final PropertyDescriptor RANGE_LENGTH = new PropertyDescriptor.Builder()
@@ -143,43 +139,41 @@ public class FetchSwiftObject extends AbstractProcessor {
             .description("Number of bytes to read from the object. If not set, reads until end.")
             .required(false)
             .addValidator(StandardValidators.DATA_SIZE_VALIDATOR)
-            .expressionLanguageSupported(org.apache.nifi.expression.ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
+            .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
             .build();
 
-    // Statically define property list
-    static final List<PropertyDescriptor> propDescriptors;
-
+    private static final List<PropertyDescriptor> PROPERTY_DESCRIPTORS;
     static {
-        final List<PropertyDescriptor> _temp = new ArrayList<>();
-        _temp.add(SWIFT_AUTH_METHOD);
-        _temp.add(SWIFT_AUTH_URL);
-        _temp.add(SWIFT_USERNAME);
-        _temp.add(SWIFT_PASSWORD);
-        _temp.add(SWIFT_TENANT);
-        _temp.add(CONTAINER);
-        _temp.add(OBJECT_NAME);
-        _temp.add(RANGE_START);
-        _temp.add(RANGE_LENGTH);
-        propDescriptors = Collections.unmodifiableList(_temp);
+        List<PropertyDescriptor> list = new ArrayList<>();
+        list.add(SWIFT_AUTH_METHOD);
+        list.add(SWIFT_AUTH_URL);
+        list.add(SWIFT_USERNAME);
+        list.add(SWIFT_PASSWORD);
+        list.add(SWIFT_TENANT);
+        list.add(CONTAINER);
+        list.add(OBJECT_NAME);
+        list.add(RANGE_START);
+        list.add(RANGE_LENGTH);
+        PROPERTY_DESCRIPTORS = Collections.unmodifiableList(list);
     }
 
     @Override
     protected List<PropertyDescriptor> getSupportedPropertyDescriptors() {
-        return propDescriptors;
+        return PROPERTY_DESCRIPTORS;
     }
 
     @Override
     public Set<Relationship> getRelationships() {
-        Set<Relationship> rels = new HashSet<>();
-        rels.add(REL_SUCCESS);
-        rels.add(REL_FAILURE);
-        return rels;
+        Set<Relationship> relationships = new HashSet<>();
+        relationships.add(REL_SUCCESS);
+        relationships.add(REL_FAILURE);
+        return relationships;
     }
 
     @Override
-    public Collection<ValidationResult> customValidate(ValidationContext context) {
-        // No special validations yet, but you can add checks if needed
-        return new ArrayList<>(super.customValidate(context));
+    public Collection<ValidationResult> customValidate(ValidationContext validationContext) {
+        // Add custom validations here if needed
+        return super.customValidate(validationContext);
     }
 
     @Override
@@ -189,170 +183,218 @@ public class FetchSwiftObject extends AbstractProcessor {
             return;
         }
 
-        final ComponentLog logger = getLogger();
-
-        final String containerName = context.getProperty(CONTAINER).evaluateAttributeExpressions(flowFile).getValue();
-        final String objectName = context.getProperty(OBJECT_NAME).evaluateAttributeExpressions(flowFile).getValue();
-
-        if (containerName == null || containerName.isEmpty() || objectName == null || objectName.isEmpty()) {
-            logger.error("Container or Object Name is invalid");
-            flowFile = session.putAttribute(flowFile, "swift.fetch.error", "Empty container/object name");
-            session.transfer(flowFile, REL_FAILURE);
-            return;
-        }
-
-        // Build the account/container
-        Account account;
-        Container container;
         try {
-            account = buildAccount(context);
-            container = account.getContainer(containerName);
-            if (!container.exists()) {
-                logger.error("Container {} does not exist", containerName);
-                flowFile = session.putAttribute(flowFile, "swift.fetch.error", "Container not found");
-                session.transfer(flowFile, REL_FAILURE);
-                return;
-            }
-        } catch (Exception ex) {
-            logger.error("Failed to connect to Swift", ex);
-            flowFile = session.putAttribute(flowFile, "swift.fetch.error", "Swift connection failed: " + ex.getMessage());
-            session.transfer(flowFile, REL_FAILURE);
-            return;
-        }
+            long startNanos = System.nanoTime();
 
-        // Get range config
-        long rangeStart = 0L;
-        Long rangeLength = null;
-        try {
-            if (context.getProperty(RANGE_START).isSet()) {
-                rangeStart = context.getProperty(RANGE_START).evaluateAttributeExpressions(flowFile)
-                        .asDataSize(DataUnit.B).longValue();
-            }
-            if (context.getProperty(RANGE_LENGTH).isSet()) {
-                rangeLength = context.getProperty(RANGE_LENGTH).evaluateAttributeExpressions(flowFile)
-                        .asDataSize(DataUnit.B).longValue();
-            }
-        } catch (Exception ex) {
-            logger.error("Invalid range settings", ex);
-            flowFile = session.putAttribute(flowFile, "swift.fetch.error", "Invalid range: " + ex.getMessage());
-            session.transfer(flowFile, REL_FAILURE);
-            return;
-        }
+            flowFile = fetchObject(context, session, flowFile);
 
-        // Try to fetch the object
-        StoredObject so = container.getObject(objectName);
-        try {
-            if (!so.exists()) {
-                logger.warn("Object {} in container {} does not exist", new Object[]{objectName, containerName});
-                flowFile = session.putAttribute(flowFile, "swift.fetch.error", "Object not found");
-                session.transfer(flowFile, REL_FAILURE);
-                return;
-            }
-        } catch (Exception ex) {
-            logger.error("Error checking existence for object {}", new Object[]{objectName, ex});
-            flowFile = session.putAttribute(flowFile, "swift.fetch.error", "Error checking existence: " + ex.getMessage());
-            session.transfer(flowFile, REL_FAILURE);
-            return;
-        }
+            long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
+            flowFile = updateFlowFileAttributes(context, session, flowFile, elapsedMillis);
 
-        DownloadInstructions dInstr = new DownloadInstructions();
+            session.transfer(flowFile, REL_SUCCESS);
 
-        // If both rangeStart & rangeLength set => read from 'rangeStart' to 'rangeStart + rangeLength - 1'
-        if (rangeStart >= 0 && rangeLength != null && rangeLength > 0) {
-            long end = rangeStart + rangeLength - 1;
-            MyByteRange myRange = new MyByteRange(rangeStart, end);
-            dInstr.setRange(myRange);
-        } else if (rangeStart > 0) {
-            // pass -1 as end => in MyByteRange => means "till the end"
-            MyByteRange myRange = new MyByteRange(rangeStart, -1);
-            dInstr.setRange(myRange);
-        } else if (rangeLength != null && rangeLength > 0) {
-            MyByteRange myRange = new MyByteRange(0, rangeLength - 1);
-            dInstr.setRange(myRange);
-        }
-
-        final long startNanos = System.nanoTime();
-
-        try (InputStream in = so.downloadObjectAsInputStream(dInstr)) {
-            flowFile = session.importFrom(in, flowFile);
-        } catch (FlowFileAccessException ffae) {
-            logger.error("Failed to download object: {}", new Object[]{ffae.getMessage(), ffae});
-            flowFile = session.putAttribute(flowFile, "swift.fetch.error", "FlowFileAccessException: " + ffae.getMessage());
+        } catch (SwiftFetchException e) {
+            getLogger().error("Swift fetch failed: {}", e.getMessage(), e);
+            flowFile = session.putAttribute(flowFile, "swift.fetch.error", e.getMessage());
             flowFile = session.penalize(flowFile);
             session.transfer(flowFile, REL_FAILURE);
-            return;
-        } catch (IOException ioex) {
-            logger.error("IO error fetching object: {}", new Object[]{ioex.getMessage(), ioex});
-            flowFile = session.putAttribute(flowFile, "swift.fetch.error", "IOException: " + ioex.getMessage());
-            flowFile = session.penalize(flowFile);
-            session.transfer(flowFile, REL_FAILURE);
-            return;
-        } catch (Exception ex) {
-            logger.error("Error fetching object: {}", new Object[]{ex.getMessage(), ex});
-            flowFile = session.putAttribute(flowFile, "swift.fetch.error", "Exception: " + ex.getMessage());
-            flowFile = session.penalize(flowFile);
-            session.transfer(flowFile, REL_FAILURE);
-            return;
         }
-
-        // Update attributes with metadata
-        Map<String, String> attrs = new HashMap<>();
-        attrs.put("swift.container", containerName);
-        attrs.put("swift.filename", objectName);
-
-        // Reload metadata
-        try {
-            so.reload(); // get updated metadata
-            String etag = so.getEtag();
-            if (etag != null) {
-                attrs.put("swift.etag", etag);
-            }
-            long length = so.getContentLength();
-            attrs.put("swift.length", String.valueOf(length));
-
-            Date lm = so.getLastModifiedAsDate();
-            if (lm != null) {
-                attrs.put("swift.lastModified", String.valueOf(lm.getTime()));
-            }
-
-            // If content type is known
-            String contentType = so.getContentType();
-            if (contentType != null && !contentType.isEmpty()) {
-                attrs.put(CoreAttributes.MIME_TYPE.key(), contentType);
-            }
-        } catch (Exception ex) {
-            logger.warn("Failed to reload metadata after fetch: {}", new Object[]{ex.getMessage(), ex});
-        }
-
-        long millis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
-
-        flowFile = session.putAllAttributes(flowFile, attrs);
-        session.getProvenanceReporter().fetch(flowFile, so.getPublicURL(), millis);
-        session.transfer(flowFile, REL_SUCCESS);
-        logger.info("Successfully fetched Swift object {} from container {} in {} ms", new Object[]{objectName, containerName, millis});
     }
 
-    private Account buildAccount(ProcessContext context) {
-        String authUrl = context.getProperty(SWIFT_AUTH_URL).getValue();
-        String method = context.getProperty(SWIFT_AUTH_METHOD).getValue();
-        String user = context.getProperty(SWIFT_USERNAME).getValue();
-        String pass = context.getProperty(SWIFT_PASSWORD).getValue();
-        String tenant = context.getProperty(SWIFT_TENANT).getValue();
+    /**
+     * Downloads the Swift object's content into the given FlowFile.
+     */
+    private FlowFile fetchObject(ProcessContext context, ProcessSession session, FlowFile flowFile)
+            throws SwiftFetchException {
+        final ComponentLog log = getLogger();
 
-        AccountFactory factory = new AccountFactory()
-                .setAuthUrl(authUrl)
-                .setUsername(user)
-                .setPassword(pass);
+        String containerName = evaluateEL(context, flowFile, CONTAINER);
+        String objectName = evaluateEL(context, flowFile, OBJECT_NAME);
 
-        if ("KEYSTONE".equalsIgnoreCase(method)) {
-            factory.setAuthenticationMethod(AuthenticationMethod.KEYSTONE);
-            if (tenant != null && !tenant.isEmpty()) {
-                factory.setTenantName(tenant);
-            }
-        } else {
-            factory.setAuthenticationMethod(AuthenticationMethod.TEMPAUTH);
+        if (isEmpty(containerName) || isEmpty(objectName)) {
+            throw new SwiftFetchException("Empty container or object name");
         }
 
-        return factory.createAccount();
+        Account account = buildSwiftAccount(context);
+        Container container = getValidatedContainer(account, containerName);
+        StoredObject storedObject = getValidatedStoredObject(container, objectName);
+
+        long rangeStart = parseRangeStart(context, flowFile);
+        Long rangeLength = parseRangeLength(context, flowFile);
+        DownloadInstructions instructions = buildDownloadInstructions(rangeStart, rangeLength);
+
+        try (InputStream in = storedObject.downloadObjectAsInputStream(instructions)) {
+            flowFile = session.importFrom(in, flowFile);
+        } catch (FlowFileAccessException | IOException ex) {
+            throw new SwiftFetchException("I/O error fetching object: " + ex.getMessage(), ex);
+        } catch (Exception ex) {
+            throw new SwiftFetchException("Exception while fetching object: " + ex.getMessage(), ex);
+        }
+
+        // Save minimal Swift info for next step
+        Map<String, String> tempAttrs = new HashMap<>();
+        tempAttrs.put("swift.temp.container", containerName);
+        tempAttrs.put("swift.temp.objectName", objectName);
+        flowFile = session.putAllAttributes(flowFile, tempAttrs);
+
+        log.debug("Fetched object {} from container {}", objectName, containerName);
+        return flowFile;
+    }
+
+    /**
+     * Updates the FlowFile attributes with Swift metadata, sets MIME type, and reports Provenance.
+     */
+    private FlowFile updateFlowFileAttributes(ProcessContext context,
+                                              ProcessSession session,
+                                              FlowFile flowFile,
+                                              long elapsedMillis) throws SwiftFetchException {
+
+        final ComponentLog log = getLogger();
+
+        // Retrieve container and object name from attributes
+        String containerName = flowFile.getAttribute("swift.temp.container");
+        String objectName = flowFile.getAttribute("swift.temp.objectName");
+
+        // Rebuild Swift objects for metadata reload
+        Account account = buildSwiftAccount(context);
+        Container container = getValidatedContainer(account, containerName);
+        StoredObject storedObject = getValidatedStoredObject(container, objectName);
+
+        Map<String, String> finalAttributes = new HashMap<>();
+
+        finalAttributes.put("swift.container", containerName);
+        finalAttributes.put("swift.filename", objectName);
+
+        try {
+            storedObject.reload();
+            if (!isEmpty(storedObject.getEtag())) {
+                finalAttributes.put("swift.etag", storedObject.getEtag());
+            }
+            finalAttributes.put("swift.length", String.valueOf(storedObject.getContentLength()));
+
+            Date lastModified = storedObject.getLastModifiedAsDate();
+            if (lastModified != null) {
+                finalAttributes.put("swift.lastModified", String.valueOf(lastModified.getTime()));
+            }
+
+            String contentType = storedObject.getContentType();
+            if (!isEmpty(contentType)) {
+                finalAttributes.put(CoreAttributes.MIME_TYPE.key(), contentType);
+            }
+        } catch (Exception ex) {
+            log.warn("Could not reload metadata for object {}: {}", objectName, ex.getMessage(), ex);
+        }
+
+        flowFile = session.putAllAttributes(flowFile, finalAttributes);
+        session.getProvenanceReporter().fetch(flowFile, storedObject.getPublicURL(), elapsedMillis);
+
+        log.info("Successfully fetched {} from container {} in {} ms", objectName, containerName, elapsedMillis);
+        return flowFile;
+    }
+
+    private Account buildSwiftAccount(ProcessContext context) throws SwiftFetchException {
+        try {
+            String authUrl = context.getProperty(SWIFT_AUTH_URL).getValue();
+            String authMethod = context.getProperty(SWIFT_AUTH_METHOD).getValue();
+            String username = context.getProperty(SWIFT_USERNAME).getValue();
+            String password = context.getProperty(SWIFT_PASSWORD).getValue();
+            String tenant = context.getProperty(SWIFT_TENANT).getValue();
+
+            AccountFactory factory = new AccountFactory()
+                    .setAuthUrl(authUrl)
+                    .setUsername(username)
+                    .setPassword(password);
+
+            if ("KEYSTONE".equalsIgnoreCase(authMethod)) {
+                factory.setAuthenticationMethod(AuthenticationMethod.KEYSTONE);
+                if (!isEmpty(tenant)) {
+                    factory.setTenantName(tenant);
+                }
+            } else {
+                factory.setAuthenticationMethod(AuthenticationMethod.TEMPAUTH);
+            }
+            return factory.createAccount();
+
+        } catch (Exception ex) {
+            throw new SwiftFetchException("Swift account creation failed: " + ex.getMessage(), ex);
+        }
+    }
+
+    private Container getValidatedContainer(Account account, String containerName) throws SwiftFetchException {
+        try {
+            Container container = account.getContainer(containerName);
+            if (!container.exists()) {
+                throw new SwiftFetchException("Container not found: " + containerName);
+            }
+            return container;
+        } catch (Exception ex) {
+            throw new SwiftFetchException("Failed to connect to container: " + ex.getMessage(), ex);
+        }
+    }
+
+    private StoredObject getValidatedStoredObject(Container container, String objectName) throws SwiftFetchException {
+        StoredObject storedObject = container.getObject(objectName);
+        try {
+            if (!storedObject.exists()) {
+                throw new SwiftFetchException("Object not found: " + objectName);
+            }
+        } catch (Exception ex) {
+            throw new SwiftFetchException("Error checking object existence: " + ex.getMessage(), ex);
+        }
+        return storedObject;
+    }
+
+    private DownloadInstructions buildDownloadInstructions(long start, Long length) {
+        DownloadInstructions instructions = new DownloadInstructions();
+        if (start < 0) {
+            start = 0;
+        }
+        if (length != null && length > 0) {
+            long end = (start > 0) ? (start + length - 1) : (length - 1);
+            instructions.setRange(new SwiftByteRange(start, end));
+        } else if (start > 0) {
+            instructions.setRange(new SwiftByteRange(start, -1));
+        }
+        return instructions;
+    }
+
+    private long parseRangeStart(ProcessContext context, FlowFile flowFile) {
+        if (!context.getProperty(RANGE_START).isSet()) {
+            return 0L;
+        }
+        return context.getProperty(RANGE_START)
+                .evaluateAttributeExpressions(flowFile)
+                .asDataSize(DataUnit.B)
+                .longValue();
+    }
+
+    private Long parseRangeLength(ProcessContext context, FlowFile flowFile) {
+        if (!context.getProperty(RANGE_LENGTH).isSet()) {
+            return null;
+        }
+        return context.getProperty(RANGE_LENGTH)
+                .evaluateAttributeExpressions(flowFile)
+                .asDataSize(DataUnit.B)
+                .longValue();
+    }
+
+    private String evaluateEL(ProcessContext context, FlowFile flowFile, PropertyDescriptor descriptor) {
+        return context.getProperty(descriptor).evaluateAttributeExpressions(flowFile).getValue();
+    }
+
+    private boolean isEmpty(String val) {
+        return val == null || val.isEmpty();
+    }
+
+    /**
+     * Custom exception to unify error handling in fetch operations.
+     */
+    private static class SwiftFetchException extends RuntimeException {
+        SwiftFetchException(String message) {
+            super(message);
+        }
+        SwiftFetchException(String message, Throwable cause) {
+            super(message, cause);
+        }
     }
 }

@@ -2,13 +2,13 @@ package org.nifi.processors;
 
 import org.javaswift.joss.headers.object.range.AbstractRange;
 
-public class MyByteRange extends AbstractRange {
+public class SwiftByteRange extends AbstractRange {
 
     /**
      * Creates a range from 'start' to 'end' (inclusive).
      * In the parent, 'offset' = start, 'length' = end.
      */
-    public MyByteRange(long start, long end) {
+    public SwiftByteRange(long start, long end) {
         super(start, end);
     }
 
