@@ -1,7 +1,6 @@
 import org.gradle.api.JavaVersion
 
 plugins {
-    // پلاگین جاوا برای ساخت JAR
     java
     id("me.ragill.nar-plugin") version "1.0.2"
 }
