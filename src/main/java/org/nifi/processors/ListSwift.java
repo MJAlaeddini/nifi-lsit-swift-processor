@@ -1,3 +1,11 @@
+/**
+ * NiFi Processor that lists objects from Swift.
+ * <p>
+ * This processor connects to a Swift container, applies age and size filters on stored objects,
+ * and creates FlowFiles with object attributes. It supports both timestamp-based and entity-based
+ * tracking to avoid duplicate processing, with state stored in NiFi's cluster state.
+ * </p>
+ */
 package org.nifi.processors;
 
 import org.apache.nifi.annotation.behavior.InputRequirement;
@@ -12,7 +20,9 @@ import org.apache.nifi.annotation.configuration.DefaultSchedule;
 import org.apache.nifi.annotation.documentation.CapabilityDescription;
 import org.apache.nifi.annotation.documentation.SeeAlso;
 import org.apache.nifi.annotation.documentation.Tags;
-import org.apache.nifi.components.*;
+import org.apache.nifi.components.AllowableValue;
+import org.apache.nifi.components.PropertyDescriptor;
+import org.apache.nifi.components.PropertyValue;
 import org.apache.nifi.components.state.Scope;
 import org.apache.nifi.components.state.StateMap;
 import org.apache.nifi.flowfile.FlowFile;
@@ -39,7 +49,7 @@ import java.util.concurrent.atomic.AtomicReference;
 @TriggerWhenEmpty
 @InputRequirement(Requirement.INPUT_FORBIDDEN)
 @Tags({"openstack", "swift", "object-storage", "list"})
-@SeeAlso({})
+@SeeAlso()
 @CapabilityDescription("Lists objects from Swift, supports Entity or Timestamp tracking to avoid duplicates, plus size limits.")
 @Stateful(scopes = Scope.CLUSTER, description = "Stores info to avoid re-listing.")
 @DefaultSchedule(strategy = SchedulingStrategy.TIMER_DRIVEN, period = "1 min")
@@ -55,10 +65,8 @@ public class ListSwift extends AbstractProcessor {
             .name("success")
             .description("All listed objects")
             .build();
+    private static final Set<Relationship> RELATIONSHIPS = Collections.singleton(REL_SUCCESS);
 
-    private static final Set<Relationship> RELS = Collections.singleton(REL_SUCCESS);
-
-    // Authentication props
     public static final PropertyDescriptor SWIFT_AUTH_URL = new PropertyDescriptor.Builder()
             .name("swift-auth-url")
             .displayName("Auth URL")
@@ -103,7 +111,6 @@ public class ListSwift extends AbstractProcessor {
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
             .build();
 
-    // Container / listing props
     public static final PropertyDescriptor CONTAINER = new PropertyDescriptor.Builder()
             .name("swift-container")
             .displayName("Container")
@@ -129,7 +136,6 @@ public class ListSwift extends AbstractProcessor {
             .addValidator(StandardValidators.POSITIVE_INTEGER_VALIDATOR)
             .build();
 
-    // Age / size props
     public static final PropertyDescriptor MIN_AGE = new PropertyDescriptor.Builder()
             .name("min-age")
             .displayName("Min Age")
@@ -155,7 +161,6 @@ public class ListSwift extends AbstractProcessor {
             .addValidator(StandardValidators.DATA_SIZE_VALIDATOR)
             .build();
 
-    // Tracking props
     public static final AllowableValue TRACK_TIMESTAMP = new AllowableValue("timestamp", "Timestamp", "Track by lastModified");
     public static final AllowableValue TRACK_ENTITY = new AllowableValue("entity", "Entity", "Track each object name");
     public static final PropertyDescriptor TRACKING_STRATEGY = new PropertyDescriptor.Builder()
@@ -167,62 +172,60 @@ public class ListSwift extends AbstractProcessor {
             .defaultValue(TRACK_TIMESTAMP.getValue())
             .build();
 
-    // State keys
     private static final String STATE_TIMESTAMP = "swift.timestamp";
-    private static final String STATE_KEY_PREFIX = "swift.key-"; // used in timestamp mode
-    private static final String STATE_ENTITY_KEY_PREFIX = "swift.entity-"; // used in entity mode
+    private static final String STATE_KEY_PREFIX = "swift.key-";
+    private static final String STATE_ENTITY_KEY_PREFIX = "swift.entity-";
 
     private volatile Account swiftAccount;
     private volatile Container swiftContainer;
 
     private volatile long minAgeMs;
     private volatile Long maxAgeMs;
-    private volatile long maxFileSize = Long.MAX_VALUE;
+    private volatile long maxFileSize;
     private volatile int pageSize;
-    private volatile TrackingState trackingState;
+    private volatile TrackingMode trackingMode;
 
     private final AtomicReference<ListingState> listingState = new AtomicReference<>(ListingState.empty());
 
+    enum TrackingMode { TIMESTAMP, ENTITY }
+
     static class ListingState {
-        final long timestamp;   // used in Timestamp mode
-        final Set<String> latestKeys; // for same timestamp
-        final Set<String> entityKeys; // used in Entity mode
-        ListingState(long ts, Set<String> keys, Set<String> entities) {
-            this.timestamp = ts;
-            this.latestKeys = keys;
-            this.entityKeys = entities;
+        final long timestamp;
+        final Set<String> timestampKeys;
+        final Set<String> entityKeys;
+
+        ListingState(long timestamp, Set<String> timestampKeys, Set<String> entityKeys) {
+            this.timestamp = timestamp;
+            this.timestampKeys = timestampKeys;
+            this.entityKeys = entityKeys;
         }
+
         static ListingState empty() {
             return new ListingState(0L, Collections.emptySet(), Collections.emptySet());
         }
     }
 
-    enum TrackingState {
-        TIMESTAMP,
-        ENTITY
-    }
-
     @Override
     public Set<Relationship> getRelationships() {
-        return Collections.singleton(REL_SUCCESS);
+        return RELATIONSHIPS;
     }
 
     @Override
     protected List<PropertyDescriptor> getSupportedPropertyDescriptors() {
-        List<PropertyDescriptor> props = new ArrayList<>();
-        props.add(SWIFT_AUTH_URL);
-        props.add(AUTH_METHOD);
-        props.add(SWIFT_USERNAME);
-        props.add(SWIFT_PASSWORD);
-        props.add(SWIFT_TENANT);
-        props.add(CONTAINER);
-        props.add(PREFIX);
-        props.add(PAGE_SIZE);
-        props.add(MIN_AGE);
-        props.add(MAX_AGE);
-        props.add(MAX_SIZE);
-        props.add(TRACKING_STRATEGY);
-        return props;
+        List<PropertyDescriptor> descriptors = new ArrayList<>();
+        descriptors.add(SWIFT_AUTH_URL);
+        descriptors.add(AUTH_METHOD);
+        descriptors.add(SWIFT_USERNAME);
+        descriptors.add(SWIFT_PASSWORD);
+        descriptors.add(SWIFT_TENANT);
+        descriptors.add(CONTAINER);
+        descriptors.add(PREFIX);
+        descriptors.add(PAGE_SIZE);
+        descriptors.add(MIN_AGE);
+        descriptors.add(MAX_AGE);
+        descriptors.add(MAX_SIZE);
+        descriptors.add(TRACKING_STRATEGY);
+        return descriptors;
     }
 
     @Override
@@ -237,173 +240,146 @@ public class ListSwift extends AbstractProcessor {
             return;
         }
 
-        if (swiftAccount == null || swiftContainer == null) {
-            try {
-                swiftAccount = buildSwiftAccount(context);
-                String containerName = context.getProperty(CONTAINER).getValue();
-                swiftContainer = swiftAccount.getContainer(containerName);
-                if (!swiftContainer.exists()) {
-                    logger.error("Container not found: {}", containerName);
-                    context.yield();
-                    return;
-                }
-            } catch (Exception ex) {
-                logger.error("Swift connection failed", ex);
-                context.yield();
-                return;
-            }
-        }
-
-        minAgeMs = context.getProperty(MIN_AGE).asTimePeriod(TimeUnit.MILLISECONDS);
-        maxAgeMs = context.getProperty(MAX_AGE).isSet()
-                ? context.getProperty(MAX_AGE).asTimePeriod(TimeUnit.MILLISECONDS)
-                : null;
-        pageSize = context.getProperty(PAGE_SIZE).asInteger();
-        if (context.getProperty(MAX_SIZE).isSet()) {
-            maxFileSize = context.getProperty(MAX_SIZE).asDataSize(DataUnit.B).longValue();
-        } else {
-            maxFileSize = Long.MAX_VALUE;
-        }
-        trackingState = "entity".equalsIgnoreCase(context.getProperty(TRACKING_STRATEGY).getValue())
-                ? TrackingState.ENTITY
-                : TrackingState.TIMESTAMP;
-
-        String prefixVal = context.getProperty(PREFIX).getValue();
-        if (prefixVal == null) prefixVal = "";
-
-        // current state
-        long now = System.currentTimeMillis();
-        long lastTs = listingState.get().timestamp;
-        Set<String> lastKeys = listingState.get().latestKeys;
-        Set<String> entityKeys = listingState.get().entityKeys;
-
-        long newMaxTs = lastTs;
-        Set<String> newMaxKeys = new HashSet<>(lastKeys); // for the same TS
-        Set<String> newEntityKeys = new HashSet<>(entityKeys);
-
-        List<StoredObject> discovered = new ArrayList<>();
-        String marker = null;
-        boolean done = false;
-
-        while (!done) {
-            // list objects
-            Collection<StoredObject> cObjects = swiftContainer.list(prefixVal, marker, pageSize);
-            List<StoredObject> objects = new ArrayList<>(cObjects);
-            if (objects.isEmpty()) {
-                done = true;
-                break;
-            }
-            for (StoredObject so : objects) {
-                // Get actual metadata
-                so.reload();
-                Date lm = so.getLastModifiedAsDate();
-                long lastMod = (lm != null) ? lm.getTime() : 0L;
-                if (so.getLastModifiedAsDate() != null) {
-                    lastMod = so.getLastModifiedAsDate().getTime();
-                }
-                long size = so.getContentLength();
-
-                // If max size is set
-                if (size > maxFileSize) {
-                    continue;
-                }
-                // Age filter
-                if (!passesAgeFilter(lastMod, now)) {
-                    continue;
-                }
-
-                // Skip if already listed in entity tracking
-                if (trackingState == TrackingState.ENTITY) {
-                    if (entityKeys.contains(so.getName())) {
-                        continue;
-                    }
-                } else {
-                    // Timestamp tracking
-                    if (lastMod < lastTs) {
-                        continue;
-                    }
-                    if (lastMod == lastTs && lastKeys.contains(so.getName())) {
-                        continue;
-                    }
-                }
-
-                discovered.add(so);
-
-                // Update new state
-                if (trackingState == TrackingState.ENTITY) {
-                    newEntityKeys.add(so.getName());
-                } else {
-                    if (lastMod > newMaxTs) {
-                        newMaxTs = lastMod;
-                        newMaxKeys.clear();
-                        newMaxKeys.add(so.getName());
-                    } else if (lastMod == newMaxTs) {
-                        newMaxKeys.add(so.getName());
-                    }
-                }
-            }
-            marker = objects.get(objects.size() - 1).getName();
-            if (objects.size() < pageSize) {
-                done = true;
-            }
-        }
-
-        // create FlowFiles
-        for (StoredObject so : discovered) {
-            FlowFile ff = session.create();
-            ff = session.putAllAttributes(ff, buildAttributes(so, swiftContainer.getName()));
-            session.transfer(ff, REL_SUCCESS);
-        }
-
-        // persist state
-        if (!discovered.isEmpty()) {
-            try {
-                if (trackingState == TrackingState.ENTITY) {
-                    persistEntityState(session, newEntityKeys);
-                    listingState.set(new ListingState(lastTs, lastKeys, newEntityKeys));
-                } else {
-                    persistTimestampState(session, newMaxTs, newMaxKeys, newEntityKeys);
-                    listingState.set(new ListingState(newMaxTs, newMaxKeys, newEntityKeys));
-                }
-            } catch (IOException e) {
-                logger.error("State persist failed", e);
-            }
-        } else {
+        if (!initializeSwiftConnection(context, logger)) {
             context.yield();
+            return;
+        }
+
+        setupFilters(context);
+        List<StoredObject> newObjects = fetchNewObjects(context, logger);
+        if (newObjects.isEmpty()) {
+            context.yield();
+            return;
+        }
+
+        for (StoredObject object : newObjects) {
+            FlowFile flowFile = session.create();
+            flowFile = session.putAllAttributes(flowFile, buildAttributes(object, swiftContainer.getName()));
+            session.transfer(flowFile, REL_SUCCESS);
+        }
+
+        try {
+            updateState(session, newObjects);
+        } catch (IOException e) {
+            logger.error("State persist failed", e);
         }
     }
 
-    private boolean passesAgeFilter(long lastModified, long now) {
-        if (lastModified <= 0L) {
-            // if object has no valid lastModified, skip or treat as old
+    private boolean initializeSwiftConnection(ProcessContext context, ComponentLog logger) {
+        if (swiftAccount != null && swiftContainer != null) {
             return true;
         }
-        if (lastModified > (now - minAgeMs)) return false;
-        if (maxAgeMs != null && lastModified < (now - maxAgeMs)) return false;
+        try {
+            swiftAccount = buildSwiftAccount(context);
+            String containerName = context.getProperty(CONTAINER).getValue();
+            swiftContainer = swiftAccount.getContainer(containerName);
+            if (!swiftContainer.exists()) {
+                logger.error("Container not found: {}", containerName);
+                return false;
+            }
+        } catch (Exception ex) {
+            logger.error("Swift connection failed", ex);
+            return false;
+        }
         return true;
     }
 
-    private Map<String, String> buildAttributes(StoredObject so, String containerName) {
-        Map<String, String> attrs = new HashMap<>();
-        attrs.put(CoreAttributes.FILENAME.key(), so.getName());
-        attrs.put("swift.container", containerName);
-        attrs.put("swift.etag", so.getEtag() != null ? so.getEtag() : "");
-        attrs.put("swift.length", Long.toString(so.getContentLength()));
-        return attrs;
+    private void setupFilters(ProcessContext context) {
+        minAgeMs = context.getProperty(MIN_AGE).asTimePeriod(TimeUnit.MILLISECONDS);
+        maxAgeMs = context.getProperty(MAX_AGE).isSet() ? context.getProperty(MAX_AGE).asTimePeriod(TimeUnit.MILLISECONDS) : null;
+        pageSize = context.getProperty(PAGE_SIZE).asInteger();
+        PropertyValue maxSizeValue = context.getProperty(MAX_SIZE);
+        maxFileSize = maxSizeValue.isSet() ? maxSizeValue.asDataSize(DataUnit.B).longValue() : Long.MAX_VALUE;
+        String trackingValue = context.getProperty(TRACKING_STRATEGY).getValue();
+        trackingMode = "entity".equalsIgnoreCase(trackingValue) ? TrackingMode.ENTITY : TrackingMode.TIMESTAMP;
+    }
+
+    private List<StoredObject> fetchNewObjects(ProcessContext context, ComponentLog logger) {
+        List<StoredObject> objects = new ArrayList<>();
+        String marker = null;
+        String prefix = context.getProperty(PREFIX).getValue();
+        if (prefix == null) {
+            prefix = "";
+        }
+        long currentTime = System.currentTimeMillis();
+        ListingState currentState = listingState.get();
+        long lastTimestamp = currentState.timestamp;
+        Set<String> timestampKeys = currentState.timestampKeys;
+        Set<String> entityKeys = currentState.entityKeys;
+
+        while (true) {
+            Collection<StoredObject> page = swiftContainer.list(prefix, marker, pageSize);
+            if (page.isEmpty()) {
+                break;
+            }
+            for (StoredObject object : page) {
+                try {
+                    object.reload();
+                } catch (Exception ex) {
+                    logger.warn("Error reloading metadata, skipping: " + object.getName(), ex);
+                    continue;
+                }
+                long lastModified = object.getLastModifiedAsDate() != null ? object.getLastModifiedAsDate().getTime() : 0L;
+                if (object.getContentLength() > maxFileSize) {
+                    continue;
+                }
+                if (!passesAge(lastModified, currentTime)) {
+                    continue;
+                }
+                if (alreadyProcessed(object.getName(), lastModified, lastTimestamp, timestampKeys, entityKeys)) {
+                    continue;
+                }
+                objects.add(object);
+            }
+            List<StoredObject> objectList = new ArrayList<>(page);
+            marker = objectList.get(objectList.size() - 1).getName();
+            if (objectList.size() < pageSize) {
+                break;
+            }
+        }
+        return objects;
+    }
+
+    private boolean alreadyProcessed(String objectName, long objectLastModified, long lastTimestamp,
+                                     Set<String> timestampKeys, Set<String> entityKeys) {
+        if (trackingMode == TrackingMode.ENTITY) {
+            return entityKeys.contains(objectName);
+        } else {
+            return objectLastModified < lastTimestamp ||
+                    (objectLastModified == lastTimestamp && timestampKeys.contains(objectName));
+        }
+    }
+
+    private boolean passesAge(long lastModified, long currentTime) {
+        if (lastModified <= 0L) {
+            return true;
+        }
+        if (lastModified > (currentTime - minAgeMs)) {
+            return false;
+        }
+        return maxAgeMs == null || lastModified >= (currentTime - maxAgeMs);
+    }
+
+    private Map<String, String> buildAttributes(StoredObject object, String containerName) {
+        Map<String, String> attributes = new HashMap<>();
+        attributes.put(CoreAttributes.FILENAME.key(), object.getName());
+        attributes.put("swift.container", containerName);
+        attributes.put("swift.etag", object.getEtag() != null ? object.getEtag() : "");
+        attributes.put("swift.length", Long.toString(object.getContentLength()));
+        return attributes;
     }
 
     private Account buildSwiftAccount(ProcessContext context) {
         String authUrl = context.getProperty(SWIFT_AUTH_URL).getValue();
-        String user = context.getProperty(SWIFT_USERNAME).getValue();
-        String pass = context.getProperty(SWIFT_PASSWORD).getValue();
+        String username = context.getProperty(SWIFT_USERNAME).getValue();
+        String password = context.getProperty(SWIFT_PASSWORD).getValue();
         String tenant = context.getProperty(SWIFT_TENANT).getValue();
         String method = context.getProperty(AUTH_METHOD).getValue();
 
         AccountFactory factory = new AccountFactory()
                 .setAuthUrl(authUrl)
-                .setUsername(user)
-                .setPassword(pass);
-
+                .setUsername(username)
+                .setPassword(password);
         if ("KEYSTONE".equalsIgnoreCase(method)) {
             factory.setAuthenticationMethod(AuthenticationMethod.KEYSTONE);
             if (tenant != null && !tenant.isEmpty()) {
@@ -416,57 +392,80 @@ public class ListSwift extends AbstractProcessor {
     }
 
     private void restoreState(ProcessSession session) throws IOException {
-        StateMap map = session.getState(Scope.CLUSTER);
-        if (map == null || map.toMap().isEmpty()) {
+        StateMap stateMap = session.getState(Scope.CLUSTER);
+        if (stateMap == null || stateMap.toMap().isEmpty()) {
             listingState.set(ListingState.empty());
             return;
         }
-        long ts = 0L;
-        Set<String> lastKeys = new HashSet<>();
-        Set<String> entityKeys = new HashSet<>();
-
-        String tsVal = map.get(STATE_TIMESTAMP);
-        if (tsVal != null) {
-            ts = Long.parseLong(tsVal);
+        long restoredTimestamp = 0L;
+        Set<String> restoredTimestampKeys = new HashSet<>();
+        Set<String> restoredEntityKeys = new HashSet<>();
+        String tsValue = stateMap.get(STATE_TIMESTAMP);
+        if (tsValue != null) {
+            restoredTimestamp = Long.parseLong(tsValue);
         }
-        // timestamp keys
-        for (Map.Entry<String, String> e : map.toMap().entrySet()) {
-            if (e.getKey().startsWith(STATE_KEY_PREFIX)) {
-                lastKeys.add(e.getValue());
+        for (Map.Entry<String, String> entry : stateMap.toMap().entrySet()) {
+            if (entry.getKey().startsWith(STATE_KEY_PREFIX)) {
+                restoredTimestampKeys.add(entry.getValue());
+            } else if (entry.getKey().startsWith(STATE_ENTITY_KEY_PREFIX)) {
+                restoredEntityKeys.add(entry.getValue());
             }
         }
-        // entity keys
-        for (Map.Entry<String, String> e : map.toMap().entrySet()) {
-            if (e.getKey().startsWith(STATE_ENTITY_KEY_PREFIX)) {
-                entityKeys.add(e.getValue());
-            }
-        }
-        listingState.set(new ListingState(ts, lastKeys, entityKeys));
+        listingState.set(new ListingState(restoredTimestamp, restoredTimestampKeys, restoredEntityKeys));
     }
 
-    private void persistTimestampState(ProcessSession session, long ts, Set<String> keys, Set<String> entityKeys) throws IOException {
+    private void updateState(ProcessSession session, List<StoredObject> newObjects) throws IOException {
+        ListingState currentState = listingState.get();
+        long lastTimestamp = currentState.timestamp;
+        Set<String> timestampKeys = new HashSet<>(currentState.timestampKeys);
+        Set<String> entityKeys = new HashSet<>(currentState.entityKeys);
+        long newTimestamp = lastTimestamp;
+        Set<String> newTimestampKeys = new HashSet<>(timestampKeys);
+
+        for (StoredObject object : newObjects) {
+            long lastModified = object.getLastModifiedAsDate() != null ? object.getLastModifiedAsDate().getTime() : 0L;
+            if (trackingMode == TrackingMode.ENTITY) {
+                entityKeys.add(object.getName());
+            } else {
+                if (lastModified > newTimestamp) {
+                    newTimestamp = lastModified;
+                    newTimestampKeys.clear();
+                    newTimestampKeys.add(object.getName());
+                } else if (lastModified == newTimestamp) {
+                    newTimestampKeys.add(object.getName());
+                }
+            }
+        }
+        if (trackingMode == TrackingMode.ENTITY) {
+            persistEntityState(session, entityKeys);
+            listingState.set(new ListingState(lastTimestamp, timestampKeys, entityKeys));
+        } else {
+            persistTimestampState(session, newTimestamp, newTimestampKeys, entityKeys);
+            listingState.set(new ListingState(newTimestamp, newTimestampKeys, entityKeys));
+        }
+    }
+
+    private void persistTimestampState(ProcessSession session, long timestamp, Set<String> timestampKeys, Set<String> entityKeys) throws IOException {
         Map<String, String> newState = new HashMap<>();
-        newState.put(STATE_TIMESTAMP, String.valueOf(ts));
+        newState.put(STATE_TIMESTAMP, String.valueOf(timestamp));
         int i = 0;
-        for (String k : keys) {
-            newState.put(STATE_KEY_PREFIX + i, k);
+        for (String key : timestampKeys) {
+            newState.put(STATE_KEY_PREFIX + i, key);
             i++;
         }
-        // also persist entityKeys (if user switched from entity to timestamp at runtime, or vice versa)
         int j = 0;
-        for (String ent : entityKeys) {
-            newState.put(STATE_ENTITY_KEY_PREFIX + j, ent);
+        for (String key : entityKeys) {
+            newState.put(STATE_ENTITY_KEY_PREFIX + j, key);
             j++;
         }
         session.setState(newState, Scope.CLUSTER);
     }
 
     private void persistEntityState(ProcessSession session, Set<String> entityKeys) throws IOException {
-        // we do not rely on timestamp in entity mode
         Map<String, String> newState = new HashMap<>();
         int i = 0;
-        for (String ent : entityKeys) {
-            newState.put(STATE_ENTITY_KEY_PREFIX + i, ent);
+        for (String key : entityKeys) {
+            newState.put(STATE_ENTITY_KEY_PREFIX + i, key);
             i++;
         }
         session.setState(newState, Scope.CLUSTER);
