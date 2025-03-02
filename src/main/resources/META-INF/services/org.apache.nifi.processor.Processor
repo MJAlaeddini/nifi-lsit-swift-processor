@@ -1,1 +1,2 @@
 org.nifi.processors.ListSwift
+org.nifi.processors.FetchSwiftObject
