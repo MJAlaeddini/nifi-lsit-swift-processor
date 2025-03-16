@@ -6,7 +6,7 @@ plugins {
 }
 
 group = "org.apache.nifi.processors.swift"
-version = "1.0.0"
+version = "1.1.0"
 description = "ListSwift Processor Example for NiFi (Java 8)"
 
 java {
@@ -31,10 +31,8 @@ dependencies {
     implementation("org.apache.nifi:nifi-standard-record-utils:1.26.0")
     implementation("org.apache.nifi:nifi-ssl-context-service-api:1.26.0")
     implementation("org.apache.nifi:nifi-schema-registry-service-api:1.26.0")
+    implementation("org.apache.nifi:nifi-standard-processors:1.26.0")
 
-    implementation("org.apache.jclouds:jclouds-core:2.5.0")
-    implementation("org.apache.jclouds:jclouds-all:2.5.0")
-    implementation("org.apache.jclouds.api:openstack-keystone:2.5.0")
 
     testImplementation("org.apache.nifi:nifi-mock:1.26.0")
     testImplementation("org.apache.nifi:nifi-mock-record-utils:1.26.0")
