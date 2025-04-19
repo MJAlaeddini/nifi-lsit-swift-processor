@@ -79,17 +79,12 @@ public class SwiftService {
         }
     }
 
-    /**
-     * متد کمکی برای لیست کردن آبجکت‌های موجود (با prefix یا marker) – در صورت نیاز paging کنید.
-     */
+
     public List<StoredObject> listObjects(Container container, String prefix, String marker, int pageSize) {
         Collection<StoredObject> page = container.list(prefix, marker, pageSize);
         return new ArrayList<>(page);
     }
 
-    /**
-     * دانلود یک آبجکت – در این‌جا فقط ورودی استریم برمی‌گردانیم برای مثال.
-     */
     public InputStream downloadObject(String containerName, String objectName) throws SwiftException {
         Container container = getContainer(containerName);
         StoredObject so = container.getObject(objectName);
